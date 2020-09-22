@@ -25,6 +25,7 @@
 #include "qemu/bswap.h"
 #include "qemu/bitops.h"
 #include "sysemu/numa.h"
+#include "sysemu/cpus.h"
 
 static GArray *build_alloc_array(void)
 {
@@ -50,6 +51,208 @@ static void build_append_array(GArray *array, GArray *val)
 {
     g_array_append_vals(array, val->data, val->len);
 }
+
+/*
+ * ACPI 6.3 Processor Properties Topology Table (PPTT)
+ */
+#ifdef __aarch64__
+static void build_cache_head(GArray *tbl, uint32_t next_level)
+{
+    build_append_byte(tbl, 1);
+    build_append_byte(tbl, 24);
+    build_append_int_noprefix(tbl, 0, 2);
+    build_append_int_noprefix(tbl, 127, 4);
+    build_append_int_noprefix(tbl, next_level, 4);
+}
+
+static void build_cache_tail(GArray *tbl, uint32_t cache_type)
+{
+    switch (cache_type) {
+    case ARM_L1D_CACHE: /* L1 dcache info*/
+        build_append_int_noprefix(tbl, ARM_L1DCACHE_SIZE, 4);
+        build_append_int_noprefix(tbl, ARM_L1DCACHE_SET, 4);
+        build_append_byte(tbl, ARM_L1DCACHE_ASSOCIATIVITY);
+        build_append_byte(tbl, ARM_L1DCACHE_ATTRIBUTES);
+        build_append_int_noprefix(tbl, ARM_L1DCACHE_LINE_SIZE, 2);
+        break;
+    case ARM_L1I_CACHE: /* L1 icache info*/
+        build_append_int_noprefix(tbl, ARM_L1ICACHE_SIZE, 4);
+        build_append_int_noprefix(tbl, ARM_L1ICACHE_SET, 4);
+        build_append_byte(tbl, ARM_L1ICACHE_ASSOCIATIVITY);
+        build_append_byte(tbl, ARM_L1ICACHE_ATTRIBUTES);
+        build_append_int_noprefix(tbl, ARM_L1ICACHE_LINE_SIZE, 2);
+        break;
+    case ARM_L2_CACHE: /* L2 cache info*/
+        build_append_int_noprefix(tbl, ARM_L2CACHE_SIZE, 4);
+        build_append_int_noprefix(tbl, ARM_L2CACHE_SET, 4);
+        build_append_byte(tbl, ARM_L2CACHE_ASSOCIATIVITY);
+        build_append_byte(tbl, ARM_L2CACHE_ATTRIBUTES);
+        build_append_int_noprefix(tbl, ARM_L2CACHE_LINE_SIZE, 2);
+        break;
+    case ARM_L3_CACHE: /* L3 cache info*/
+        build_append_int_noprefix(tbl, ARM_L3CACHE_SIZE, 4);
+        build_append_int_noprefix(tbl, ARM_L3CACHE_SET, 4);
+        build_append_byte(tbl, ARM_L3CACHE_ASSOCIATIVITY);
+        build_append_byte(tbl, ARM_L3CACHE_ATTRIBUTES);
+        build_append_int_noprefix(tbl, ARM_L3CACHE_LINE_SIZE, 2);
+        break;
+    default:
+        build_append_int_noprefix(tbl, 0, 4);
+        build_append_int_noprefix(tbl, 0, 4);
+        build_append_byte(tbl, 0);
+        build_append_byte(tbl, 0);
+        build_append_int_noprefix(tbl, 0, 2);
+        break;
+    }
+}
+
+static void build_cache_hierarchy(GArray *tbl,
+              uint32_t next_level, uint32_t cache_type)
+{
+    build_cache_head(tbl, next_level);
+    build_cache_tail(tbl, cache_type);
+}
+
+static void build_arm_socket_hierarchy(GArray *tbl,
+                 uint32_t offset, uint32_t id)
+{
+    build_append_byte(tbl, 0);            /* Type 0 - processor */
+    build_append_byte(tbl, 24);           /* Length, add private resources */
+    build_append_int_noprefix(tbl, 0, 2); /* Reserved */
+    build_append_int_noprefix(tbl, 1, 4); /* Processor boundary and id invalid*/
+    build_append_int_noprefix(tbl, 0, 4);
+    build_append_int_noprefix(tbl, id, 4);
+    build_append_int_noprefix(tbl, 1, 4); /* Num private resources */
+    build_append_int_noprefix(tbl, offset, 4);
+}
+
+static void build_arm_core_hierarchy(GArray *tbl,
+                 struct offset_status *offset, uint32_t id)
+{
+    if (!offset) {
+        return;
+    }
+    build_append_byte(tbl, 0);            /* Type 0 - processor */
+    build_append_byte(tbl, 32);           /* Length, add private resources */
+    build_append_int_noprefix(tbl, 0, 2); /* Reserved */
+    build_append_int_noprefix(tbl, 2, 4); /* Valid id*/
+    build_append_int_noprefix(tbl, offset->parent, 4);
+    build_append_int_noprefix(tbl, id, 4);
+    build_append_int_noprefix(tbl, 3, 4); /* Num private resources */
+    build_append_int_noprefix(tbl, offset->l1d_offset, 4);
+    build_append_int_noprefix(tbl, offset->l1i_offset, 4);
+    build_append_int_noprefix(tbl, offset->l2_offset, 4);
+}
+
+static void build_arm_smt_hierarchy(GArray *tbl,
+                 uint32_t offset, uint32_t id)
+{
+    if (!offset) {
+        return;
+    }
+    build_append_byte(tbl, 0);            /* Type 0 - processor */
+    build_append_byte(tbl, 20);           /* Length, add private resources */
+    build_append_int_noprefix(tbl, 0, 2); /* Reserved */
+    build_append_int_noprefix(tbl, 14, 4); /* Valid id*/
+    build_append_int_noprefix(tbl, offset, 4);
+    build_append_int_noprefix(tbl, id, 4);
+    build_append_int_noprefix(tbl, 0, 4); /* Num private resources */
+}
+
+void build_pptt(GArray *table_data, BIOSLinker *linker, int possible_cpus)
+{
+    int pptt_start = table_data->len;
+    int uid = 0, socket;
+    uint32_t core_offset;
+    struct offset_status offset;
+    const MachineState *ms = MACHINE(qdev_get_machine());
+    unsigned int smp_cores = ms->smp.cores;
+    unsigned int smp_sockets = ms->smp.cpus / (smp_cores * ms->smp.threads);
+
+    acpi_data_push(table_data, sizeof(AcpiTableHeader));
+
+    for (socket = 0; socket < smp_sockets; socket++) {
+        int core,thread;
+        uint32_t l3_offset = table_data->len - pptt_start;
+        build_cache_hierarchy(table_data, 0, ARM_L3_CACHE);
+
+        offset.parent = table_data->len - pptt_start;
+        build_arm_socket_hierarchy(table_data, l3_offset, socket);
+
+        for (core = 0; core < smp_cores; core++) {
+            offset.l2_offset = table_data->len - pptt_start;
+            build_cache_hierarchy(table_data, 0, ARM_L2_CACHE);
+            offset.l1d_offset = table_data->len - pptt_start;
+            build_cache_hierarchy(table_data, offset.l2_offset, ARM_L1D_CACHE);
+            offset.l1i_offset = table_data->len - pptt_start;
+            build_cache_hierarchy(table_data, offset.l2_offset, ARM_L1I_CACHE);
+            core_offset = table_data->len - pptt_start;
+            if (ms->smp.threads <= 1) {
+                build_arm_core_hierarchy(table_data, &offset, uid++);
+            } else {
+                build_arm_core_hierarchy(table_data, &offset, core);
+                for (thread = 0; thread < ms->smp.threads; thread++) {
+                    build_arm_smt_hierarchy(table_data, core_offset, uid++);
+                }
+            }
+        }
+    }
+
+    build_header(linker, table_data,
+                 (void *)(table_data->data + pptt_start), "PPTT",
+                 table_data->len - pptt_start, 2, NULL, NULL);
+}
+
+#else
+static void build_cpu_hierarchy(GArray *tbl, uint32_t flags,
+                                uint32_t parent, uint32_t id)
+{
+    build_append_byte(tbl, 0);            /* Type 0 - processor */
+    build_append_byte(tbl, 20);           /* Length, no private resources */
+    build_append_int_noprefix(tbl, 0, 2); /* Reserved */
+    build_append_int_noprefix(tbl, flags, 4);
+    build_append_int_noprefix(tbl, parent, 4);
+    build_append_int_noprefix(tbl, id, 4);
+    build_append_int_noprefix(tbl, 0, 4); /* Num private resources */
+}
+
+void build_pptt(GArray *table_data, BIOSLinker *linker, int possible_cpus)
+{
+    int pptt_start = table_data->len;
+    int uid = 0, cpus = 0, socket;
+    MachineState *ms = MACHINE(qdev_get_machine());
+    unsigned int smp_cores = ms->smp.cores;
+    unsigned int smp_threads = ms->smp.threads;
+
+    acpi_data_push(table_data, sizeof(AcpiTableHeader));
+
+    for (socket = 0; cpus < possible_cpus; socket++) {
+        uint32_t socket_offset = table_data->len - pptt_start;
+        int core;
+
+        build_cpu_hierarchy(table_data, 1, 0, socket);
+
+        for (core = 0; core < smp_cores; core++) {
+            uint32_t core_offset = table_data->len - pptt_start;
+            int thread;
+
+            if (smp_threads > 1) {
+                build_cpu_hierarchy(table_data, 0, socket_offset, core);
+                for (thread = 0; thread < smp_threads; thread++) {
+                    build_cpu_hierarchy(table_data, 2, core_offset, uid++);
+                }
+             } else {
+                build_cpu_hierarchy(table_data, 2, socket_offset, uid++);
+             }
+        }
+        cpus += smp_cores * smp_threads;
+    }
+
+    build_header(linker, table_data,
+                 (void *)(table_data->data + pptt_start), "PPTT",
+                 table_data->len - pptt_start, 1, NULL, NULL);
+}
+#endif
 
 #define ACPI_NAMESEG_LEN 4
 

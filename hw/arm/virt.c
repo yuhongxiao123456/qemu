@@ -42,6 +42,7 @@
 #include "net/net.h"
 #include "sysemu/device_tree.h"
 #include "sysemu/numa.h"
+#include "sysemu/cpus.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/kvm.h"
 #include "hw/loader.h"
@@ -302,12 +303,88 @@ static void fdt_add_timer_nodes(const VirtMachineState *vms)
                        GIC_FDT_IRQ_TYPE_PPI, ARCH_TIMER_NS_EL2_IRQ, irqflags);
 }
 
+static void fdt_add_l3cache_nodes(const VirtMachineState *vms)
+{
+    int i;
+    const MachineState *ms = MACHINE(qdev_get_machine());
+    unsigned int smp_cores = ms->smp.cores;
+    unsigned int sockets = vms->smp_cpus / smp_cores;
+
+    /* If current is not equal to max */
+    if (vms->smp_cpus % smp_cores)
+	    sockets++;
+
+    for (i = 0; i < sockets; i++) {
+        char *nodename = g_strdup_printf("/cpus/l3-cache%d", i);
+        qemu_fdt_add_subnode(vms->fdt, nodename);
+        qemu_fdt_setprop_string(vms->fdt, nodename, "compatible", "cache");
+        qemu_fdt_setprop_string(vms->fdt, nodename, "cache-unified", "true");
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "cache-level", 3);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "cache-size", 0x2000000);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "cache-line-size", 128);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "cache-sets", 2048);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "phandle",
+                              qemu_fdt_alloc_phandle(vms->fdt));
+        g_free(nodename);
+    }
+}
+
+
+static void fdt_add_l2cache_nodes(const VirtMachineState *vms)
+{
+    int i, j;
+    const MachineState *ms = MACHINE(qdev_get_machine());
+    unsigned int smp_cores = ms->smp.cores;
+    signed int sockets = vms->smp_cpus / smp_cores;
+
+    /* If current is not equal to max */
+    if (vms->smp_cpus % smp_cores)
+	    sockets++;
+
+    for (i = 0; i < sockets; i++) {
+        char *next_path = g_strdup_printf("/cpus/l3-cache%d", i);
+        for (j = 0; j < smp_cores; j++) {
+            char *nodename = g_strdup_printf("/cpus/l2-cache%d",
+                                  i * smp_cores + j);
+            qemu_fdt_add_subnode(vms->fdt, nodename);
+            qemu_fdt_setprop_string(vms->fdt, nodename, "compatible", "cache");
+            qemu_fdt_setprop_cell(vms->fdt, nodename, "cache-size", 0x80000);
+            qemu_fdt_setprop_cell(vms->fdt, nodename, "cache-line-size", 64);
+            qemu_fdt_setprop_cell(vms->fdt, nodename, "cache-sets", 1024);
+            qemu_fdt_setprop_phandle(vms->fdt, nodename,
+                                  "next-level-cache", next_path);
+            qemu_fdt_setprop_cell(vms->fdt, nodename, "phandle",
+                                  qemu_fdt_alloc_phandle(vms->fdt));
+            g_free(nodename);
+        }
+        g_free(next_path);
+    }
+}
+
+static void fdt_add_l1cache_prop(const VirtMachineState *vms,
+                            char *nodename, int cpu)
+{
+        char *cachename = g_strdup_printf("/cpus/l2-cache%d", cpu);
+
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "d-cache-size", 0x10000);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "d-cache-line-size", 64);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "d-cache-sets", 256);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "i-cache-size", 0x10000);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "i-cache-line-size", 64);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "i-cache-sets", 256);
+        qemu_fdt_setprop_phandle(vms->fdt, nodename,
+                     "next-level-cache", cachename);
+        g_free(cachename);
+}
+
+
 static void fdt_add_cpu_nodes(const VirtMachineState *vms)
 {
     int cpu;
     int addr_cells = 1;
     const MachineState *ms = MACHINE(vms);
-
+    unsigned int smp_cores = ms->smp.cores;
+    unsigned int smp_threads = ms->smp.threads;
     /*
      * From Documentation/devicetree/bindings/arm/cpus.txt
      *  On ARM v8 64-bit systems value should be set to 2,
@@ -333,6 +410,9 @@ static void fdt_add_cpu_nodes(const VirtMachineState *vms)
     qemu_fdt_add_subnode(vms->fdt, "/cpus");
     qemu_fdt_setprop_cell(vms->fdt, "/cpus", "#address-cells", addr_cells);
     qemu_fdt_setprop_cell(vms->fdt, "/cpus", "#size-cells", 0x0);
+
+    fdt_add_l3cache_nodes(vms);
+    fdt_add_l2cache_nodes(vms);
 
     for (cpu = vms->smp_cpus - 1; cpu >= 0; cpu--) {
         char *nodename = g_strdup_printf("/cpus/cpu@%d", cpu);
@@ -362,8 +442,36 @@ static void fdt_add_cpu_nodes(const VirtMachineState *vms)
             qemu_fdt_setprop_cell(vms->fdt, nodename, "numa-node-id",
                 ms->possible_cpus->cpus[cs->cpu_index].props.node_id);
         }
+        fdt_add_l1cache_prop(vms, nodename, cpu);
+        qemu_fdt_setprop_cell(vms->fdt, nodename, "phandle",
+                              qemu_fdt_alloc_phandle(vms->fdt));
 
         g_free(nodename);
+    }
+
+    /* Add vcpu topology by fdt node cpu-map. */
+    qemu_fdt_add_subnode(vms->fdt, "/cpus/cpu-map");
+
+    for (cpu = vms->smp_cpus - 1; cpu >= 0; cpu--) {
+        char *cpu_path = g_strdup_printf("/cpus/cpu@%d", cpu);
+        char *map_path;
+
+        if (smp_threads > 1) {
+            map_path = g_strdup_printf(
+                           "/cpus/cpu-map/%s%d/%s%d/%s%d",
+                           "cluster", cpu / (smp_cores * smp_threads),
+                           "core", (cpu / smp_threads) % smp_cores,
+                           "thread", cpu % smp_threads);
+        } else {
+            map_path = g_strdup_printf(
+                           "/cpus/cpu-map/%s%d/%s%d",
+                           "cluster", cpu / smp_cores,
+                           "core", cpu % smp_cores);
+        }
+        qemu_fdt_add_path(vms->fdt, map_path);
+        qemu_fdt_setprop_phandle(vms->fdt, map_path, "cpu", cpu_path);
+        g_free(map_path);
+        g_free(cpu_path);
     }
 }
 
