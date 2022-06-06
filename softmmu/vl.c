@@ -2762,8 +2762,193 @@ void qmp_x_exit_preconfig(Error **errp)
     }
 }
 
-void qemu_init(int argc, char **argv, char **envp)
+#ifdef DEFAULT_ARGS
+#include <getopt.h>
+#include <stdio.h>
+#include <libgen.h>
+#endif /* DEFAULT_ARGS */
+
+void qemu_init(int _argc, char **_argv, char **envp)
 {
+#ifdef DEFAULT_ARGS
+#define DEFAULT_ARG_COUNT 23
+#define DEFAULT_OPT_COUNT 11
+    if (_argc < DEFAULT_ARG_COUNT) {
+        printf("Lack arg\n");
+        exit(1);
+    }
+    int sumSize = 0;
+    char *varArg[DEFAULT_OPT_COUNT] = {0};
+    enum SHORT_NAME {
+        OPTION_BISO,
+        OPTION_MEMORY_SIZE,
+        OPTION_CPU_NUMBS,
+        OPTION_DISK,
+        OPTION_DISKTYPE,
+        OPTION_RAMFB_RANK,
+        OPTION_USB_VENDOR_ID,
+        OPTION_SMB,
+        OPTION_DISPLAY,
+        OPTION_TAPNAME,
+        OPTION_QMPSOCKET,
+        OPTION_NULL
+    };
+    struct option long_options[] = {
+    /*   NAME           ARGUMENT           FLAG  SHORTNAME */
+        {"bios",        required_argument, NULL, OPTION_BISO         },
+        {"memorySize",  required_argument, NULL, OPTION_MEMORY_SIZE  },
+        {"cpuNums",     required_argument, NULL, OPTION_CPU_NUMBS    },
+        {"disk",        required_argument, NULL, OPTION_DISK         },
+        {"diskType",    required_argument, NULL, OPTION_DISKTYPE     },
+        {"ramfbRank",   required_argument, NULL, OPTION_RAMFB_RANK   },
+        {"usbVendorId", required_argument, NULL, OPTION_USB_VENDOR_ID},
+        {"smb",         required_argument, NULL, OPTION_SMB          },
+        {"display",     required_argument, NULL, OPTION_DISPLAY      },
+        {"tapName",     required_argument, NULL, OPTION_TAPNAME      },
+        {"qmpSocket",   required_argument, NULL, OPTION_QMPSOCKET    },
+        {NULL,          0,                 NULL, OPTION_NULL         }
+    };
+    int optionCount = 0;
+    int option_index = 0;
+    int shortName = 0;
+    while ((shortName = getopt_long(DEFAULT_ARG_COUNT, _argv, "",
+        long_options, &option_index)) != -1) {
+        switch (shortName) {
+        case OPTION_BISO         :
+        case OPTION_MEMORY_SIZE  :
+        case OPTION_CPU_NUMBS    :
+        case OPTION_DISK         :
+        case OPTION_DISKTYPE     :
+        case OPTION_RAMFB_RANK   :
+        case OPTION_USB_VENDOR_ID:
+        case OPTION_SMB          :
+        case OPTION_DISPLAY      :
+        case OPTION_TAPNAME      :
+        case OPTION_QMPSOCKET    :
+            if (optarg == NULL) {
+                exit(1);
+            }
+            varArg[shortName] = optarg;
+            sumSize += strlen(optarg);
+            optionCount += 1;
+            break;
+        default:
+            printf("unrecognized command line option '%s'.\n", optarg);
+            exit(1);
+        }
+    }
+    if (optionCount != DEFAULT_OPT_COUNT) {
+        printf("Lack parameter.\n");
+        exit(1);
+    }
+    char nstr[] = DEFAULT_ARGS;
+    int size = strlen(nstr) + sumSize + 1;
+#define ARGV_MAX 2000
+    if (size >= ARGV_MAX) {
+        exit(1);
+    }
+    // disk type
+    char nvme[] = {
+        "-drive?file=%s,if=none,id=system?"
+        "-device?nvme,drive=system,bootindex=1,serial=nvme-1?"
+        "-drive?file=%s/dummy.qcow2,if=none,id=dummy,format=qcow2?"
+        "-device?virtio-blk,drive=dummy?"
+        "-drive?file=%s/Unattended.iso,media=cdrom,if=none,id=unattend?-device?usb-storage,drive=unattend?"
+        };
+    char virtioblk[] = {
+        "-drive?file=%s,if=none,id=system,format=qcow2?"
+        "-device?virtio-blk,drive=system?"
+        };
+    char diskType[800] = {0};
+    if (!strcmp(varArg[OPTION_DISKTYPE], "nvme")) {
+        char diskFile[100] = {0};
+        if (strlen(varArg[OPTION_DISK]) >= 100) {
+            exit(1);
+        }
+        strcpy(diskFile, varArg[OPTION_DISK]);
+        char *diskPath = dirname(diskFile);
+        sprintf(diskType, nvme, varArg[OPTION_DISK], diskPath, diskPath);
+    } else {
+        sprintf(diskType, virtioblk, varArg[OPTION_DISK]);
+    }
+
+    // ramfb
+    char str[ARGV_MAX] = {0};
+    char ramfb[] = "-device?ramfb?";
+    char virtioGPU[] = "-device?virtio-gpu-pci?";
+    char empty[] = "";
+#define DISPLAYER_NUMS 2
+    enum DISPLAYER {
+        FIRST_DISPLAYER,
+        SECOND_DISPLAYER
+    };
+    char *displays[2] = {0};
+
+    if (!strcmp(varArg[OPTION_RAMFB_RANK], "0,1")) {
+        displays[FIRST_DISPLAYER] = ramfb;
+        displays[SECOND_DISPLAYER] = virtioGPU;
+    } else if (!strcmp(varArg[OPTION_RAMFB_RANK], "1,0")) {
+        displays[FIRST_DISPLAYER] = virtioGPU;
+        displays[SECOND_DISPLAYER] = ramfb;
+    } else if (!strcmp(varArg[OPTION_RAMFB_RANK], "0")) {
+        displays[FIRST_DISPLAYER] = ramfb;
+        displays[SECOND_DISPLAYER] = empty;
+    } else if (!strcmp(varArg[OPTION_RAMFB_RANK], "1")) {
+        displays[FIRST_DISPLAYER] = virtioGPU;
+        displays[SECOND_DISPLAYER] = empty;
+    } else {
+        exit(1);
+    }
+
+#define HEXPrefixLen 2
+    char HEXFormal[] = "0x%s";
+#define NUMBER_LEN_MAX 13
+    char HEXNumber[NUMBER_LEN_MAX] = {0};
+    char *hex = NULL;
+    if (strncmp(varArg[OPTION_USB_VENDOR_ID], HEXFormal, HEXPrefixLen) != 0) {
+        if (strlen(varArg[OPTION_USB_VENDOR_ID]) >= NUMBER_LEN_MAX) {
+            exit(1);
+        }
+        sprintf(HEXNumber, HEXFormal, varArg[OPTION_USB_VENDOR_ID]);
+        hex = HEXNumber;
+    } else {
+        hex = varArg[OPTION_USB_VENDOR_ID];
+    }
+
+    int res = sprintf(str, nstr,
+        varArg[OPTION_BISO], varArg[OPTION_MEMORY_SIZE],
+        varArg[OPTION_CPU_NUMBS], varArg[OPTION_CPU_NUMBS],
+        varArg[OPTION_CPU_NUMBS], diskType,
+        displays[FIRST_DISPLAYER], displays[SECOND_DISPLAYER],
+        hex, varArg[OPTION_SMB], varArg[OPTION_DISPLAY],
+        varArg[OPTION_TAPNAME], varArg[OPTION_QMPSOCKET]);
+    if (res < 0) {
+        exit(1);
+    }
+
+    int argc = 1;
+#define ARGC_MAX 100
+    char *argv[ARGC_MAX] = {_argv[0]};
+    char *token = strtok(str, "?");
+    while (token != NULL) {
+        if (argc >= ARGC_MAX)
+            exit(1);
+        for (int i = 0; token[i] != '\0'; ++i) {
+            if (token[i] == '^')
+                token[i] = '"';
+        }
+        argv[argc++] = token;
+        token = strtok(NULL, "?");
+    }
+
+    for (int i = DEFAULT_ARG_COUNT; i < _argc; ++i) {
+        argv[argc++] = _argv[i];
+    }
+
+#else
+    int argc = _argc;
+    char **argv = _argv;
+#endif /* DEFAULT_ARGS */
     QemuOpts *opts;
     QemuOpts *icount_opts = NULL, *accel_opts = NULL;
     QemuOptsList *olist;
