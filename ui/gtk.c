@@ -32,6 +32,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/log.h"
 #include "qapi/qapi-commands-control.h"
 #include "qapi/qapi-commands-machine.h"
 #include "qapi/qapi-commands-misc.h"
@@ -51,6 +52,16 @@
 #include <vte/vte.h>
 #endif
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <errno.h>
+#include <stddef.h>
+#include <unistd.h>
+#include <sys/time.h>
 
 #include "trace.h"
 #include "qemu/cutils.h"
@@ -381,6 +392,165 @@ static void *gd_win32_get_hwnd(VirtualConsole *vc)
 #endif
 }
 
+#define WINBOX_DRAW_ENABLE 1
+
+#ifdef  WINBOX_DRAW_ENABLE
+#define WINBOX_DRAW_MAGIC 0
+#define WINBOX_DRAW_DATA_LEGTH 1
+#define WINBOX_DRAW_PIXELENGTH 2
+#define WINBOX_DRAW_WIDTH 3
+#define WINBOX_DRAW_HEIGHT 4
+#define WINBOX_DRAW_TITLE_MAX 5
+#define WINBOX_MAGIC_NUM 0x3a4b5c7d
+#define WINBOX_SOCK_PATH "/KAssistant/KAssistantVM/frontend_qemu.sock"
+#define WINBOX_DISPLAY_CONNECT_CYCLE_TIME 3
+#define WINBOX_SOCK_HOME_PATH_LENGTH_MAX 256
+#define WINBOX_SOCK_PATH_LENGTH_MAX 64 + WINBOX_SOCK_HOME_PATH_LENGTH_MAX
+
+static int g_winbox_display_fd = -1;
+static unsigned int g_winbox_display_title[WINBOX_DRAW_TITLE_MAX] = {WINBOX_MAGIC_NUM, 0, 0, 0, 0};
+static char g_winbox_sock_path[WINBOX_SOCK_PATH_LENGTH_MAX] = {0};
+
+static bool winbox_is_dir_exist(char *dir)
+{
+    struct stat buffer;
+    memset(&buffer, 0, sizeof(buffer));
+
+    if (stat(dir, &buffer) == 0) {
+        return S_ISDIR(buffer.st_mode);
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR, "winbox dir not exist \n");
+        return false;
+    }
+}
+
+static int winbox_get_sock_path(void)
+{
+    char *home = getenv("HOME");
+    bool isDir = false;
+
+    memset(g_winbox_sock_path, 0x0, sizeof(g_winbox_sock_path));
+    if (home != NULL) {
+        if (strlen(home) > WINBOX_SOCK_HOME_PATH_LENGTH_MAX - 1) {
+            qemu_log_mask(LOG_GUEST_ERROR, "winbox home path too long \n");
+            return -1;
+        }
+        isDir = winbox_is_dir_exist(home);
+        if (isDir == false) {
+            return -1;
+        }
+        
+        strcpy(g_winbox_sock_path, home);
+        strcpy(g_winbox_sock_path, WINBOX_SOCK_PATH);
+        return 0;
+    } else {
+        qemu_log_mask(LOG_GUEST_ERROR, "winbox get home path fail \n");
+        return -1;
+    }
+}
+
+static int winbox_display_connect_host(void)
+{
+    struct sockaddr_un un;
+    int sock_fd;
+    int handshake = WINBOX_MAGIC_NUM;
+    int ret = -1;
+
+    un.sun_family = AF_UNIX;
+    ret = winbox_get_sock_path();
+    if (ret != 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "winbox connect host get sock path fail \n");
+        return -1;
+    }
+    strcpy(un.sun_path, g_winbox_sock_path);
+    sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        qemu_log_mask(LOG_GUEST_ERROR, "winbox connect host, request socket fail \n");
+        return -1;
+    }
+
+    if (connect(sock_fd, (struct sockaddr *)&un, sizeof(un)) < 0) {
+        close(sock_fd);
+        return -1;
+    }
+    ret = send(sock_fd, &handshake, sizeof(int), 0);
+    if (ret < 0) {
+        close(sock_fd);
+        return -1;
+    }
+
+    return sock_fd;
+}
+
+static int winbox_sendData(unsigned char *data, int length)
+{
+    unsigned char *buffer = data;
+    int sendLength = length;
+    int ret = -1;
+
+    if (g_winbox_display_title[WINBOX_DRAW_DATA_LEGTH] > 0 ) {
+        while (sendLength) {
+            ret = send(g_winbox_display_fd, buffer, sendLength, MSG_NOSIGNAL);
+            if (ret < 0) {
+                qemu_log_mask(LOG_GUEST_ERROR, "winbox transfer draw, send data error %d, %d||%d \n", 
+                    ret, errno, sendLength);
+                return -1;
+            }
+            sendLength = sendLength - ret;
+            buffer = buffer + ret;
+        }
+    }
+    
+    return 0;
+}
+
+static void winbox_transferDraw(VirtualConsole *vc)
+{
+    int ret = -1;
+    int pixelLength = 0;
+    unsigned char *buffer = NULL;
+    cairo_format_t display_format = CAIRO_FORMAT_INVALID;
+
+    display_format = cairo_image_surface_get_format(vc->gfx.surface);
+    switch (display_format) {
+        case CAIRO_FORMAT_ARGB32:
+        case CAIRO_FORMAT_RGB24:
+            pixelLength = 4; // 像素类型大小byte为单位
+            break;
+        default:
+            pixelLength = 0;
+            qemu_log_mask(LOG_GUEST_ERROR, "winbox transfer draw, pixelLength: %d, format %d \n",
+                pixelLength, display_format);
+            break;
+    }
+    
+    if (g_winbox_display_fd > 0 && pixelLength != 0) {
+        g_winbox_display_title[WINBOX_DRAW_MAGIC] = WINBOX_MAGIC_NUM;
+        g_winbox_display_title[WINBOX_DRAW_DATA_LEGTH] = 
+            pixelLength * surface_width(vc->gfx.ds) * surface_height(vc->gfx.ds);
+        g_winbox_display_title[WINBOX_DRAW_PIXELENGTH] = pixelLength;
+        g_winbox_display_title[WINBOX_DRAW_WIDTH] = surface_width(vc->gfx.ds);
+        g_winbox_display_title[WINBOX_DRAW_HEIGHT] = surface_height(vc->gfx.ds);
+
+        // 先发送头数据
+        ret = send(g_winbox_display_fd, &g_winbox_display_title, WINBOX_DRAW_TITLE_MAX * sizeof(int), MSG_NOSIGNAL);
+        if (ret < 0) {
+            qemu_log_mask(LOG_GUEST_ERROR, "winbox transfer draw, send head error %d, %d \n", ret, errno);
+            close(g_winbox_display_fd);
+            g_winbox_display_fd = -1;
+        } else {
+            buffer = cairo_image_surface_get_data(vc->gfx.surface);
+            ret = winbox_sendData(buffer, g_winbox_display_title[WINBOX_DRAW_DATA_LEGTH]);
+            if (ret < 0) {
+                close(g_winbox_display_fd);
+                g_winbox_display_fd = -1;
+            }
+        }
+    }
+}
+
+#endif
+
 /** DisplayState Callbacks **/
 
 static void gd_update(DisplayChangeListener *dcl,
@@ -431,6 +601,9 @@ static void gd_update(DisplayChangeListener *dcl,
 
     gtk_widget_queue_draw_area(vc->gfx.drawing_area,
                                mx + x1, my + y1, (x2 - x1), (y2 - y1));
+#ifdef WINBOX_DRAW_ENABLE
+    winbox_transferDraw(vc);
+#endif
 }
 
 static void gd_refresh(DisplayChangeListener *dcl)
@@ -2236,6 +2409,20 @@ static void gd_create_menus(GtkDisplayState *s)
     g_object_set(G_OBJECT(settings), "gtk-menu-bar-accel", "", NULL);
 }
 
+#ifdef WINBOX_DRAW_ENABLE
+static void startWinBoxDisplayMgrThread(void)
+{
+    while (true) {
+        if (g_winbox_display_fd == -1) {
+            g_winbox_display_fd = winbox_display_connect_host();
+            if (g_winbox_display_fd > 0) {
+                qemu_log_mask(LOG_GUEST_ERROR, "start winbox display mgr thread, connect: %d \n", g_winbox_display_fd);
+            }
+        }
+        sleep(WINBOX_DISPLAY_CONNECT_CYCLE_TIME);
+    }
+}
+#endif
 
 static gboolean gtkinit;
 
@@ -2310,6 +2497,10 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
 
     gtk_widget_show_all(s->window);
 
+#ifdef WINBOX_DRAW_ENABLE
+    gtk_widget_hide(s->window);
+#endif
+
     vc = gd_vc_find_current(s);
     gtk_widget_set_sensitive(s->view_menu, vc != NULL);
 #ifdef CONFIG_VTE
@@ -2326,6 +2517,13 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
         gtk_menu_item_activate(GTK_MENU_ITEM(s->grab_on_hover_item));
     }
     gd_clipboard_init(s);
+
+#ifdef WINBOX_DRAW_ENABLE
+    gtk_init(NULL, NULL);
+    #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    gdk_threads_init();
+    g_thread_new("WinboxDisplayMgrThread", (void *)startWinBoxDisplayMgrThread, NULL);
+#endif
 }
 
 static void early_gtk_display_init(DisplayOptions *opts)
