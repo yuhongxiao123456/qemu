@@ -441,7 +441,7 @@ static int winbox_get_sock_path(void)
         }
         
         strcpy(g_winbox_sock_path, home);
-        strcpy(g_winbox_sock_path, WINBOX_SOCK_PATH);
+        strcat(g_winbox_sock_path, WINBOX_SOCK_PATH);
         return 0;
     } else {
         qemu_log_mask(LOG_GUEST_ERROR, "winbox get home path fail \n");
@@ -2522,7 +2522,7 @@ static void gtk_display_init(DisplayState *ds, DisplayOptions *opts)
     gtk_init(NULL, NULL);
     #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
     gdk_threads_init();
-    g_thread_new("WinboxDisplayMgrThread", (void *)startWinBoxDisplayMgrThread, NULL);
+    g_thread_new("WinBoxDisplayMgrThread", (void *)startWinBoxDisplayMgrThread, NULL);
 #endif
 }
 
