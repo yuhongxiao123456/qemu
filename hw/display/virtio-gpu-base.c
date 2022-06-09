@@ -45,8 +45,8 @@ virtio_gpu_base_fill_display_info(VirtIOGPUBase *g,
     for (i = 0; i < g->conf.max_outputs; i++) {
         if (g->enabled_output_bitmask & (1 << i)) {
             dpy_info->pmodes[i].enabled = 1;
-            dpy_info->pmodes[i].r.width = cpu_to_le32(g->req_state[i].width);
-            dpy_info->pmodes[i].r.height = cpu_to_le32(g->req_state[i].height);
+            dpy_info->pmodes[i].r.width = 1920;
+            dpy_info->pmodes[i].r.height = 1080;
         }
     }
 }
